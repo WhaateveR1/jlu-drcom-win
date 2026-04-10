@@ -1,0 +1,11 @@
+config.toml
+config.local.toml
+*.local.toml
+dist/
+*.exe
+*.test
+coverage.out
+*.log
+*.tmp
+.env
+.vscode/

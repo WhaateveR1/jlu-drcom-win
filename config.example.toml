@@ -1,0 +1,30 @@
+username = "student_id"
+password = "password"
+
+# 一般不需要再填写其他字段。程序会自动选择当前可用的物理 IPv4 网卡，
+# 并读取它的 IP 和 MAC。
+#
+# 如果自动选错网卡，填写网卡名称的一部分：
+# adapter_hint = "以太网"
+#
+# 如果仍然需要手动指定，取消下面两行注释：
+# ip = "192.168.1.100"
+# mac = "00:11:22:33:44:55"
+#
+# 高级默认值，通常不用改：
+# host_name = "auto"
+# os_info = "Windows"
+# server_ip = "10.100.61.3"
+# server_port = 61440
+# bind_ip = "0.0.0.0"
+# bind_port = 61440
+# auth_version = "6800"
+# keepalive_version = "dc02"
+# first_heartbeat_version = "0f27"
+# extra_heartbeat_version = "db02"
+# primary_dns = "10.10.10.10"
+# dhcp_server = "0.0.0.0"
+# debug_hex_dump = false
+# receive_timeout_ms = 2000
+# retry_count = 3
+# heartbeat_interval_seconds = 20
