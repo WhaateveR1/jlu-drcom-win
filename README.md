@@ -1,89 +1,50 @@
 # jlu-drcom-win
 
-吉林大学校园网 Dr.COM 认证客户端 Windows 版。
+吉林大学校园网 Dr.COM 认证客户端，面向 Windows 的轻量托盘程序。仅交付 `drcom-tray.exe`，早期 CLI 已移除。
 
-这是一个面向 Windows 日常使用的重构版客户端：保留原 C 项目里已经验证过的协议字段和校验算法，重新实现配置、UDP 收发、心跳、下线、重连和托盘操作。
+## 使用
 
-## 下载和使用
-
-从 GitHub Releases 下载 `jlu-drcom-win.zip`，解压后运行：
-
-```powershell
-Copy-Item config.example.toml config.toml
-notepad .\config.toml
-.\drcom-tray.exe -config .\config.toml
-```
-
-`config.toml` 里只需要填写：
+1. 解压发布包，把 `config.example.toml` 复制为 `config.toml`，填写校园网账号和密码。
+2. 退出其他 Dr.COM 客户端，双击 `drcom-tray.exe`，程序自动登录。
+3. 点击托盘图标管理登录、下线、开机自启，或打开配置与日志目录。
 
 ```toml
 username = "你的校园网账号"
 password = "你的校园网密码"
+# 多网卡环境建议明确指定校园网网卡：
+# adapter_hint = "以太网"
 ```
 
-程序会自动读取当前物理网卡的 IPv4、MAC 和电脑名。完整说明见 [USER_GUIDE.md](USER_GUIDE.md)。
+配置默认从 exe 所在目录读取。日志位于 `%LOCALAPPDATA%\jlu-drcom-win\logs`，不要求安装目录可写。
 
-## 当前功能
+## 行为与边界
 
-- Windows 托盘程序：登录、下线、退出、状态展示、开机自启。
-- 命令行程序：适合首次配置和查看日志。
-- 自动读取当前物理网卡 IPv4 和 MAC。
-- 登录、双心跳保活、超时重试。
-- Ctrl+C 或托盘退出时发送下线包。
-- 心跳失败后关闭旧 socket、重新绑定并重新登录。
-- 发布包不包含本地 `config.toml`。
+- 使用当前用户登录计划任务自启，无人为延迟；网卡未就绪时后台重试。
+- 认证 UDP 绑定校园网 IPv4，并在 Windows 上指定出接口；不自动更改 DNS、全局路由或 Clash 设置。
+- 按请求类型、心跳阶段及序号匹配应答，过滤迟到或无关报文，退出可中断正在等待的收包。
+- 重连前重新读取配置和网卡信息；连续故障按 5、10、20、40、60 秒退避，认证恢复后重置。
+- 配置错误或服务器拒绝登录时停止自动重试，修正后点击 `Login`。
+- `Authenticated` 表示登录及心跳验证成功，不保证 DNS、代理或所有网页可用。
+- 日志只记录协议阶段、长度、结果，不输出报文、密码派生值或会话令牌；运行中轮转日志。
+- 单实例运行，支持 Explorer 重启后的图标恢复、休眠恢复重连，以及有时限的退出/注销清理。
 
-## 命令行
-
-只测试登录：
-
-```powershell
-.\drcom-win.exe -config .\config.toml -login-only
-```
-
-登录并持续保活：
-
-```powershell
-.\drcom-win.exe -config .\config.toml
-```
+详见 [使用指南](USER_GUIDE.md)、[网络排查](docs/NETWORK_TROUBLESHOOTING.md)、[审查记录与修复状态](docs/CODE_REVIEW_2026-10-03.md)。
 
 ## 构建
 
+Windows，Go 1.22 或更高版本：
+
 ```powershell
-go test ./...
+.\scripts\test-build.ps1
 .\scripts\build.ps1
 ```
 
-发布包：
+脚本运行测试和 vet，只在成功后更新 `dist\jlu-drcom-win.zip`。不会清理或覆盖已解压运行目录中的用户配置。发布包不含真实账号或日志。
 
-```text
-dist\jlu-drcom-win.zip
-```
+[开发说明](docs/DEVELOPMENT.md) · [发布流程](docs/RELEASE.md) · [协议字段](docs/PROTOCOL_FIELDS.md)
 
-GitHub 发布流程见 [docs/RELEASE.md](docs/RELEASE.md)。
+## 限制与致谢
 
-## 项目结构
+账号密码仍以明文保存在本地配置中，请限制该文件访问权限。默认图标为系统图标；没有 Windows Service，不能在用户登录前显示托盘。网卡筛选依赖名称和显式配置，无法覆盖所有第三方虚拟网卡命名。真实关机、休眠、多网卡切换与无网开机仍需在各自机器上验证。
 
-```text
-cmd/
-  drcom-win/      命令行入口
-  drcom-tray/     托盘入口
-
-internal/
-  config/         配置解析、默认值、网卡自动探测
-  protocol/       协议包构造、解析、校验算法
-  transport/      UDP socket、timeout、来源校验
-  runner/         登录、心跳、下线、重连状态机
-  trayapp/        Windows 托盘程序
-  logging/        日志和 hex dump
-```
-
-开发说明见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)，协议字段表见 [docs/PROTOCOL_FIELDS.md](docs/PROTOCOL_FIELDS.md)。
-
-## 致谢
-
-本项目的协议字段整理和早期验证参考了原 C 项目 [AndrewLawrence80/jlu-drcom-client](https://github.com/AndrewLawrence80/jlu-drcom-client)。本项目不是逐行移植，而是在保留协议知识的基础上用 Go 重写 Windows 客户端运行模型。
-
-## 许可
-
-本项目按 CC BY-NC-SA 4.0 发布，见 [LICENSE](LICENSE)。
+协议知识参考原 C 项目 [AndrewLawrence80/jlu-drcom-client](https://github.com/AndrewLawrence80/jlu-drcom-client)，保留已验证的协议构包与校验算法。按 CC BY-NC-SA 4.0 发布，见 [LICENSE](LICENSE) 和 [NOTICE.md](NOTICE.md)。

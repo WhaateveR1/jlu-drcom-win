@@ -101,8 +101,14 @@ func BuildLoginPacket(config Config, session *Session, rng io.Reader) []byte {
 }
 
 func ParseLoginResponse(packet []byte, session *Session) error {
+	if len(packet) > 0 && packet[0] == 0x05 {
+		return fmt.Errorf("authentication rejected by server")
+	}
 	if len(packet) < 39 {
 		return fmt.Errorf("login response too short: got %d bytes", len(packet))
+	}
+	if packet[0] != 0x04 {
+		return fmt.Errorf("unexpected login response type: %02x", packet[0])
 	}
 	copy(session.ServerDrcomIndicator[:], packet[23:39])
 	return nil

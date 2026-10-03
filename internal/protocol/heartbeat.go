@@ -19,8 +19,9 @@ func BuildKeepAliveAuth(session Session, now time.Time) []byte {
 }
 
 func ParseKeepAliveAuthResponse(packet []byte) error {
-	if len(packet) == 0 {
-		return fmt.Errorf("keepalive auth response is empty")
+	// This reply's declared length is 16, not the full datagram length (72).
+	if len(packet) < 72 || packet[0] != 0x07 || packet[2] != 16 || packet[3] != 0 || packet[4] != 0x06 {
+		return fmt.Errorf("invalid keepalive auth response")
 	}
 	return nil
 }
@@ -43,16 +44,16 @@ func BuildHeartbeatStep1(config Config, session Session, rng io.Reader) []byte {
 }
 
 func ParseHeartbeatStep1Response(packet []byte, session *Session) error {
-	if len(packet) < 20 {
-		return fmt.Errorf("heartbeat step1 response too short: got %d bytes", len(packet))
+	if !validHeartbeat(packet) || packet[5] != 0x02 || packet[1] != byte(session.HeartbeatCount) {
+		return fmt.Errorf("invalid heartbeat step1 response")
 	}
 	copy(session.HeartbeatToken[:], packet[16:20])
 	return nil
 }
 
 func ParseHeartbeatAck(packet []byte) error {
-	if len(packet) == 0 {
-		return fmt.Errorf("heartbeat response is empty")
+	if !validHeartbeat(packet) {
+		return fmt.Errorf("invalid heartbeat response")
 	}
 	return nil
 }

@@ -22,6 +22,7 @@ Run from the repository root:
 
 ```powershell
 go test ./...
+.\scripts\test-build.ps1
 .\scripts\build.ps1
 ```
 
@@ -37,7 +38,6 @@ The zip should contain:
 CHANGELOG.md
 config.example.toml
 drcom-tray.exe
-drcom-win.exe
 LICENSE
 NOTICE.md
 README.md
@@ -49,8 +49,8 @@ USER_GUIDE.md
 The GitHub Actions workflow builds and uploads the Windows package automatically.
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 Pushing a `v*` tag creates or updates the GitHub Release and uploads `jlu-drcom-win.zip`.

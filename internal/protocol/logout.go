@@ -28,8 +28,8 @@ func BuildLogoutPacket(config Config, session Session) []byte {
 }
 
 func ParseLogoutResponse(packet []byte) error {
-	if len(packet) == 0 {
-		return fmt.Errorf("logout response is empty")
+	if len(packet) < 25 || len(packet) >= 39 || packet[0] != 0x04 {
+		return fmt.Errorf("invalid logout response")
 	}
 	return nil
 }

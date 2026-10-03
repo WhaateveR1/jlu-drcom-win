@@ -3,9 +3,14 @@
 package trayapp
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -34,14 +39,62 @@ var (
 const startupRunKey = `Software\Microsoft\Windows\CurrentVersion\Run`
 const startupValueName = "jlu-drcom-tray"
 
-func startupEnabled() bool {
+func legacyStartupEnabled() bool {
 	value, err := readStartupValue()
 	return err == nil && strings.TrimSpace(value) != ""
 }
 
-func setStartupEnabled(enabled bool, command string) error {
-	if enabled {
-		return writeStartupValue(command)
+// Task Scheduler starts the tray at logon without Explorer's Run-key delay.
+// InteractiveToken keeps the tray in the user's desktop and needs no password.
+const startupScript = `
+$ErrorActionPreference = 'Stop'
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$name = 'jlu-drcom-tray-' + $sid
+$task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+switch ($env:DRCOM_STARTUP_MODE) {
+  'query' { if ($task -and $task.State -ne 'Disabled') { 'enabled' }; break }
+  'disable' { if ($task) { Unregister-ScheduledTask -TaskName $name -Confirm:$false }; break }
+  'enable' {
+    $action = New-ScheduledTaskAction -Execute $env:DRCOM_STARTUP_EXE -Argument $env:DRCOM_STARTUP_ARGS -WorkingDirectory $env:DRCOM_STARTUP_DIR
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $sid
+    $principal = New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
+    Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    break
+  }
+  default { throw 'Invalid startup mode' }
+}
+exit 0
+`
+
+func runStartupTask(mode, configPath string) (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	abs, err := filepath.Abs(configPath)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", startupScript)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	cmd.Env = append(os.Environ(), "DRCOM_STARTUP_MODE="+mode, "DRCOM_STARTUP_EXE="+exe,
+		"DRCOM_STARTUP_ARGS=-config "+syscall.EscapeArg(abs)+" -autologin", "DRCOM_STARTUP_DIR="+filepath.Dir(exe))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("startup task %s: %w: %s", mode, err, strings.TrimSpace(string(output)))
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func ConfigureStartup(mode, configPath string) error {
+	if mode != "enable" && mode != "disable" {
+		return fmt.Errorf("startup must be enable or disable")
+	}
+	if _, err := runStartupTask(mode, configPath); err != nil {
+		return err
 	}
 	return deleteStartupValue()
 }

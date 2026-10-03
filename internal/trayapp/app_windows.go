@@ -4,11 +4,11 @@ package trayapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
-	"strings"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -16,26 +16,30 @@ import (
 
 	"jlu-drcom-win/internal/config"
 	"jlu-drcom-win/internal/runner"
-	"jlu-drcom-win/internal/transport"
 )
 
 const (
 	windowClassName = "jluDrcomTrayWindow"
 	trayIconID      = 1
 
-	wmClose       = 0x0010
-	wmDestroy     = 0x0002
-	wmCommand     = 0x0111
-	wmUser        = 0x0400
-	wmTray        = wmUser + 1
-	wmMouseMove   = 0x0200
-	wmLButtonUp   = 0x0202
-	wmLButtonDbl  = 0x0203
-	wmRButtonUp   = 0x0205
-	wmRButtonDbl  = 0x0206
-	wmContextMenu = 0x007b
-	ninSelect     = wmUser
-	ninKeySelect  = wmUser + 1
+	wmClose           = 0x0010
+	wmDestroy         = 0x0002
+	wmCommand         = 0x0111
+	wmUser            = 0x0400
+	wmTray            = wmUser + 1
+	wmStatus          = wmUser + 2
+	wmWorkerDone      = wmUser + 3
+	wmQueryEndSession = 0x0011
+	wmEndSession      = 0x0016
+	wmPowerBroadcast  = 0x0218
+	wmMouseMove       = 0x0200
+	wmLButtonUp       = 0x0202
+	wmLButtonDbl      = 0x0203
+	wmRButtonUp       = 0x0205
+	wmRButtonDbl      = 0x0206
+	wmContextMenu     = 0x007b
+	ninSelect         = wmUser
+	ninKeySelect      = wmUser + 1
 
 	nimAdd        = 0x00000000
 	nimModify     = 0x00000001
@@ -62,66 +66,79 @@ const (
 	menuLogout  = 102
 	menuStartup = 103
 	menuExit    = 104
+	menuConfig  = 105
+	menuLogs    = 106
 )
 
 var (
-	user32              = syscall.NewLazyDLL("user32.dll")
-	kernel32            = syscall.NewLazyDLL("kernel32.dll")
-	shell32             = syscall.NewLazyDLL("shell32.dll")
-	procRegisterClassEx = user32.NewProc("RegisterClassExW")
-	procCreateWindowEx  = user32.NewProc("CreateWindowExW")
-	procDefWindowProc   = user32.NewProc("DefWindowProcW")
-	procDestroyWindow   = user32.NewProc("DestroyWindow")
-	procPostQuitMessage = user32.NewProc("PostQuitMessage")
-	procGetMessage      = user32.NewProc("GetMessageW")
-	procTranslateMsg    = user32.NewProc("TranslateMessage")
-	procDispatchMsg     = user32.NewProc("DispatchMessageW")
-	procPostMessage     = user32.NewProc("PostMessageW")
-	procLoadIcon        = user32.NewProc("LoadIconW")
-	procCreatePopupMenu = user32.NewProc("CreatePopupMenu")
-	procAppendMenu      = user32.NewProc("AppendMenuW")
-	procDestroyMenu     = user32.NewProc("DestroyMenu")
-	procTrackPopupMenu  = user32.NewProc("TrackPopupMenu")
-	procGetCursorPos    = user32.NewProc("GetCursorPos")
-	procSetForeground   = user32.NewProc("SetForegroundWindow")
-	procGetModuleHandle = kernel32.NewProc("GetModuleHandleW")
-	procShellNotifyIcon = shell32.NewProc("Shell_NotifyIconW")
+	user32                    = syscall.NewLazyDLL("user32.dll")
+	kernel32                  = syscall.NewLazyDLL("kernel32.dll")
+	shell32                   = syscall.NewLazyDLL("shell32.dll")
+	procRegisterClassEx       = user32.NewProc("RegisterClassExW")
+	procCreateWindowEx        = user32.NewProc("CreateWindowExW")
+	procDefWindowProc         = user32.NewProc("DefWindowProcW")
+	procDestroyWindow         = user32.NewProc("DestroyWindow")
+	procPostQuitMessage       = user32.NewProc("PostQuitMessage")
+	procGetMessage            = user32.NewProc("GetMessageW")
+	procTranslateMsg          = user32.NewProc("TranslateMessage")
+	procDispatchMsg           = user32.NewProc("DispatchMessageW")
+	procPostMessage           = user32.NewProc("PostMessageW")
+	procLoadIcon              = user32.NewProc("LoadIconW")
+	procCreatePopupMenu       = user32.NewProc("CreatePopupMenu")
+	procAppendMenu            = user32.NewProc("AppendMenuW")
+	procDestroyMenu           = user32.NewProc("DestroyMenu")
+	procTrackPopupMenu        = user32.NewProc("TrackPopupMenu")
+	procGetCursorPos          = user32.NewProc("GetCursorPos")
+	procSetForeground         = user32.NewProc("SetForegroundWindow")
+	procGetModuleHandle       = kernel32.NewProc("GetModuleHandleW")
+	procCreateMutex           = kernel32.NewProc("CreateMutexW")
+	procRegisterWindowMessage = user32.NewProc("RegisterWindowMessageW")
+	procShellNotifyIcon       = shell32.NewProc("Shell_NotifyIconW")
+	procShellExecute          = shell32.NewProc("ShellExecuteW")
+	procMessageBox            = user32.NewProc("MessageBoxW")
 
 	activeMu  sync.Mutex
 	activeApp *App
 )
 
 type App struct {
-	cfg        config.Config
 	configPath string
-	rng        io.Reader
+	logPath    string
 	logger     *slog.Logger
 
 	hwnd uintptr
 	nid  notifyIconData
 
-	mu      sync.Mutex
-	status  string
-	cancel  context.CancelFunc
-	done    chan error
-	runner  *runner.Runner
-	exiting bool
+	mu          sync.Mutex
+	status      string
+	cancel      context.CancelFunc
+	done        chan struct{}
+	workerErr   error
+	desired     bool
+	suspended   bool
+	exiting     bool
+	autoLogin   bool
+	startup     bool
+	startupBusy bool
 }
 
-func New(cfg config.Config, configPath string, rng io.Reader, logger *slog.Logger) *App {
+func (a *App) SetAutoLogin(enabled bool) { a.autoLogin = enabled }
+
+func New(configPath, logPath string, logger *slog.Logger) *App {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &App{
-		cfg:        cfg,
 		configPath: configPath,
-		rng:        rng,
+		logPath:    logPath,
 		logger:     logger,
 		status:     string(runner.StateStopped),
 	}
 }
 
 func (a *App) Run() error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	setActiveApp(a)
 	defer setActiveApp(nil)
 
@@ -129,11 +146,38 @@ func (a *App) Run() error {
 		return err
 	}
 	if err := a.addTrayIcon(); err != nil {
-		procDestroyWindow.Call(a.hwnd)
-		return err
+		a.logger.Warn("tray not ready; waiting for Explorer", "error", err)
 	}
 	a.setStatus("Stopped")
+	go a.refreshStartup()
+	if a.autoLogin {
+		a.startClient()
+	}
 	return messageLoop()
+}
+
+var taskbarCreated = func() uint32 {
+	name, _ := syscall.UTF16PtrFromString("TaskbarCreated")
+	id, _, _ := procRegisterWindowMessage.Call(uintptr(unsafe.Pointer(name)))
+	return uint32(id)
+}()
+
+func (a *App) refreshStartup() {
+	a.mu.Lock()
+	a.startupBusy = true
+	a.mu.Unlock()
+	value, err := runStartupTask("query", a.configPath)
+	enabled := value == "enabled" || legacyStartupEnabled()
+	if err == nil && legacyStartupEnabled() {
+		err = ConfigureStartup("enable", a.configPath)
+	}
+	if err != nil {
+		a.logger.Error("refresh startup failed", "error", err)
+	}
+	a.mu.Lock()
+	a.startup = enabled
+	a.startupBusy = false
+	a.mu.Unlock()
 }
 
 func (a *App) createWindow() error {
@@ -174,6 +218,8 @@ func (a *App) createWindow() error {
 }
 
 func (a *App) addTrayIcon() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	icon, _, _ := procLoadIcon.Call(0, idiApplication)
 	a.nid = notifyIconData{
 		cbSize:           uint32(unsafe.Sizeof(notifyIconData{})),
@@ -183,7 +229,7 @@ func (a *App) addTrayIcon() error {
 		uCallbackMessage: wmTray,
 		hIcon:            icon,
 	}
-	a.setTipLocked("jlu-drcom: Stopped")
+	a.setTipLocked("jlu-drcom: " + a.status)
 	r1, _, err := procShellNotifyIcon.Call(nimAdd, uintptr(unsafe.Pointer(&a.nid)))
 	if r1 == 0 {
 		return fmt.Errorf("Shell_NotifyIconW(NIM_ADD): %w", err)
@@ -204,9 +250,8 @@ func (a *App) removeTrayIcon() {
 func (a *App) setStatus(status string) {
 	a.mu.Lock()
 	a.status = status
-	a.setTipLocked("jlu-drcom: " + status)
 	a.mu.Unlock()
-	a.modifyTip()
+	postMessage(a.hwnd, wmStatus, 0, 0)
 }
 
 func (a *App) setTipLocked(tip string) {
@@ -216,6 +261,7 @@ func (a *App) setTipLocked(tip string) {
 
 func (a *App) modifyTip() {
 	a.mu.Lock()
+	a.setTipLocked("jlu-drcom: " + a.status)
 	a.nid.uFlags = nifTip
 	nid := a.nid
 	a.mu.Unlock()
@@ -243,10 +289,18 @@ func (a *App) showMenu() {
 	appendMenu(menu, logoutFlags, menuLogout, "Logout")
 	appendSeparator(menu)
 	startupFlags := uint32(mfString)
-	if startupEnabled() {
+	a.mu.Lock()
+	if a.startup {
 		startupFlags |= mfChecked
 	}
+	if a.startupBusy {
+		startupFlags |= mfGrayed
+	}
+	a.mu.Unlock()
 	appendMenu(menu, startupFlags, menuStartup, "Start with Windows")
+	appendSeparator(menu)
+	appendMenu(menu, mfString, menuConfig, "Open configuration")
+	appendMenu(menu, mfString, menuLogs, "Open log folder")
 	appendSeparator(menu)
 	appendMenu(menu, mfString, menuExit, "Exit")
 
@@ -275,17 +329,30 @@ func (a *App) handleMenu(cmd uint16) {
 		a.toggleStartup()
 	case menuExit:
 		a.requestExit()
+	case menuConfig:
+		if err := openPath(a.configPath); err != nil {
+			ShowError(err.Error())
+		}
+	case menuLogs:
+		if err := openPath(a.logPath); err != nil {
+			ShowError(err.Error())
+		}
 	}
 }
 
 func (a *App) startClient() {
 	a.mu.Lock()
+	if a.exiting || a.suspended {
+		a.mu.Unlock()
+		return
+	}
+	a.desired = true
 	if a.cancel != nil {
 		a.mu.Unlock()
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
+	done := make(chan struct{})
 	a.cancel = cancel
 	a.done = done
 	a.exiting = false
@@ -294,30 +361,35 @@ func (a *App) startClient() {
 	a.mu.Unlock()
 	a.modifyTip()
 
-	factory := func() (runner.Exchanger, error) {
-		udpTransport, err := transport.NewTransport(a.cfg.BindUDPAddr(), a.cfg.ServerUDPAddr(), a.cfg.ReceiveTimeout)
-		if err != nil {
-			return nil, err
-		}
-		a.logger.Info("udp socket bound", "bind", a.cfg.BindAddrString(), "server", a.cfg.ServerAddrString())
-		return udpTransport, nil
-	}
-	r := runner.NewWithTransportFactory(a.cfg, factory, a.rng, a.logger)
-	a.mu.Lock()
-	a.runner = r
-	a.mu.Unlock()
-
-	go a.pollRunner(ctx, r, done)
 	go func() {
-		err := r.Run(ctx)
-		r.Close()
-		done <- err
-		a.runnerDone(err)
+		defer cancel()
+		err := a.runClient(ctx)
+		a.mu.Lock()
+		a.workerErr = err
+		a.mu.Unlock()
+		close(done)
+		postMessage(a.hwnd, wmWorkerDone, 0, 0)
 	}()
+}
+
+func (a *App) runClient(ctx context.Context) error {
+	s := runner.Supervisor{
+		Load:   func() (config.Config, error) { return config.Load(a.configPath) },
+		Logger: a.logger,
+		OnState: func(state runner.State) {
+			status := string(state)
+			if state == runner.StateOnline {
+				status = "Authenticated"
+			}
+			a.setStatus(status)
+		},
+	}
+	return s.Run(ctx)
 }
 
 func (a *App) stopClient() {
 	a.mu.Lock()
+	a.desired = false
 	cancel := a.cancel
 	a.mu.Unlock()
 	if cancel == nil {
@@ -334,6 +406,7 @@ func (a *App) requestExit() {
 		return
 	}
 	a.exiting = true
+	a.desired = false
 	cancel := a.cancel
 	running := cancel != nil
 	a.mu.Unlock()
@@ -346,76 +419,66 @@ func (a *App) requestExit() {
 	postMessage(a.hwnd, wmClose, 0, 0)
 }
 
-func (a *App) runnerDone(err error) {
+func (a *App) runnerDone() {
 	a.mu.Lock()
+	err := a.workerErr
 	exiting := a.exiting
 	a.cancel = nil
 	a.done = nil
-	a.runner = nil
-	if err != nil && !strings.Contains(err.Error(), "context canceled") {
-		a.status = "Failed"
+	if err != nil && !errors.Is(err, context.Canceled) {
+		a.status = "Failed - check config/logs; then Login"
+		a.desired = false
 		a.logger.Error("runner stopped with error", "error", err)
 	} else {
 		a.status = "Stopped"
 	}
+	if a.suspended {
+		a.status = "Suspended"
+	}
+	restart := a.desired && !a.suspended && !exiting
 	a.setTipLocked("jlu-drcom: " + a.status)
 	a.mu.Unlock()
 	a.modifyTip()
 
 	if exiting {
 		postMessage(a.hwnd, wmClose, 0, 0)
-	}
-}
-
-func (a *App) pollRunner(ctx context.Context, r *runner.Runner, done <-chan error) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-done:
-			return
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			a.setStatus(string(r.State()))
-		}
+	} else if restart {
+		a.startClient()
 	}
 }
 
 func (a *App) toggleStartup() {
-	command, err := startupCommand(a.configPath)
-	if err != nil {
-		a.logger.Error("build startup command failed", "error", err)
+	a.mu.Lock()
+	if a.startupBusy {
+		a.mu.Unlock()
 		return
 	}
-	enable := !startupEnabled()
-	if err := setStartupEnabled(enable, command); err != nil {
-		a.logger.Error("set startup failed", "error", err)
-		return
-	}
-	if enable {
-		a.logger.Info("startup enabled")
-	} else {
-		a.logger.Info("startup disabled")
-	}
+	enable := !a.startup
+	a.startupBusy = true
+	a.mu.Unlock()
+	go func() {
+		mode := "disable"
+		if enable {
+			mode = "enable"
+		}
+		err := ConfigureStartup(mode, a.configPath)
+		if err != nil {
+			a.logger.Error("set startup failed", "error", err)
+			ShowError("Could not change startup settings. See the log folder for details.")
+		}
+		a.mu.Lock()
+		if err == nil {
+			a.startup = enable
+		}
+		a.startupBusy = false
+		a.mu.Unlock()
+	}()
 }
 
 func (a *App) snapshot() (status string, running bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.status, a.cancel != nil
-}
-
-func startupCommand(configPath string) (string, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	return quoteWindowsArg(exe) + " -config " + quoteWindowsArg(configPath), nil
-}
-
-func quoteWindowsArg(arg string) string {
-	return `"` + strings.ReplaceAll(arg, `"`, `\"`) + `"`
 }
 
 func appendMenu(menu uintptr, flags uint32, id uint16, text string) {
@@ -453,7 +516,46 @@ func messageLoop() error {
 
 func windowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 	a := getActiveApp()
+	if taskbarCreated != 0 && msg == taskbarCreated && a != nil {
+		if err := a.addTrayIcon(); err != nil {
+			a.logger.Warn("restore tray icon failed", "error", err)
+		}
+		return 0
+	}
 	switch msg {
+	case wmStatus:
+		if a != nil {
+			a.modifyTip()
+		}
+		return 0
+	case wmWorkerDone:
+		if a != nil {
+			a.runnerDone()
+		}
+		return 0
+	case wmQueryEndSession:
+		return 1
+	case wmEndSession:
+		if a != nil && wParam != 0 {
+			a.stopClient()
+			a.mu.Lock()
+			done := a.done
+			a.mu.Unlock()
+			if done != nil {
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+				}
+			}
+			a.removeTrayIcon()
+			procPostQuitMessage.Call(0)
+		}
+		return 0
+	case wmPowerBroadcast:
+		if a != nil {
+			a.powerEvent(wParam)
+		}
+		return 1
 	case wmTray:
 		if a != nil && isTrayActivation(lParam) {
 			a.showMenu()

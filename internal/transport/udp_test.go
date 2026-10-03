@@ -38,7 +38,7 @@ func TestTransportExchangeWithMockUDPServer(t *testing.T) {
 	}
 	defer tr.Close()
 
-	resp, err := tr.Exchange([]byte{0x01, 0x02})
+	resp, err := tr.Exchange(context.Background(), []byte{0x01, 0x02}, nil)
 	if err != nil {
 		t.Fatalf("Exchange() error = %v", err)
 	}
@@ -63,7 +63,7 @@ func TestTransportExchangeTimeout(t *testing.T) {
 	}
 	defer tr.Close()
 
-	if _, err := tr.Exchange([]byte{0x01}); !IsTimeout(err) {
+	if _, err := tr.Exchange(context.Background(), []byte{0x01}, nil); !IsTimeout(err) {
 		t.Fatalf("Exchange() error = %v, want timeout", err)
 	}
 }

@@ -1,15 +1,16 @@
 package config
 
 import (
-	"bufio"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BurntSushi/toml"
 
 	"jlu-drcom-win/internal/protocol"
 )
@@ -53,6 +54,9 @@ type NetworkInfo struct {
 
 type NetworkDetector func(adapterHint string) (NetworkInfo, error)
 
+var ErrNetworkUnavailable = errors.New("campus adapter is not ready")
+var ErrAmbiguousNetwork = errors.New("multiple usable adapters/addresses; set adapter_hint or explicit ip and mac")
+
 func Load(path string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -66,7 +70,7 @@ func Parse(data string) (Config, error) {
 }
 
 func ParseWithDetector(data string, detect NetworkDetector) (Config, error) {
-	values, err := parseSimpleTOML(data)
+	values, err := parseTOML(data)
 	if err != nil {
 		return Config{}, err
 	}
@@ -91,7 +95,10 @@ func ParseWithDetector(data string, detect NetworkDetector) (Config, error) {
 	if needAutoNetwork {
 		cfg.AutoNetwork, err = detect(cfg.AdapterHint)
 		if err != nil {
-			return cfg, err
+			if errors.Is(err, ErrAmbiguousNetwork) {
+				return cfg, err
+			}
+			return cfg, fmt.Errorf("%w: %v", ErrNetworkUnavailable, err)
 		}
 	}
 
@@ -100,6 +107,9 @@ func ParseWithDetector(data string, detect NetworkDetector) (Config, error) {
 	}
 	if cfg.MAC, err = optionalMAC(values, "mac", cfg.AutoNetwork.MAC); err != nil {
 		return cfg, err
+	}
+	if needAutoNetwork && (cfg.IP != cfg.AutoNetwork.IP || cfg.MAC != cfg.AutoNetwork.MAC) {
+		return cfg, fmt.Errorf("ip and mac must belong to the same adapter; use both auto with adapter_hint, or set both explicitly")
 	}
 
 	cfg.HostName, err = optionalString(values, "host_name", defaultHostName())
@@ -113,7 +123,7 @@ func ParseWithDetector(data string, detect NetworkDetector) (Config, error) {
 	if cfg.ServerIP, err = optionalIPv4(values, "server_ip", [4]byte{10, 100, 61, 3}); err != nil {
 		return cfg, err
 	}
-	if cfg.BindIP, err = optionalIPv4(values, "bind_ip", [4]byte{0, 0, 0, 0}); err != nil {
+	if cfg.BindIP, err = optionalIPv4(values, "bind_ip", cfg.IP); err != nil {
 		return cfg, err
 	}
 	if cfg.PrimaryDNS, err = optionalIPv4(values, "primary_dns", [4]byte{10, 10, 10, 10}); err != nil {
@@ -153,11 +163,11 @@ func ParseWithDetector(data string, detect NetworkDetector) (Config, error) {
 		return cfg, err
 	}
 
-	cfg.ReceiveTimeout = time.Duration(cfg.ReceiveTimeoutMillis) * time.Millisecond
-	cfg.HeartbeatInterval = time.Duration(cfg.HeartbeatIntervalSecs) * time.Second
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
+	cfg.ReceiveTimeout = time.Duration(cfg.ReceiveTimeoutMillis) * time.Millisecond
+	cfg.HeartbeatInterval = time.Duration(cfg.HeartbeatIntervalSecs) * time.Second
 	return cfg, nil
 }
 
@@ -204,6 +214,7 @@ func selectAutoNetwork(candidates []networkCandidate, adapterHint string) (Netwo
 	hint := strings.ToLower(strings.TrimSpace(adapterHint))
 	var best networkCandidate
 	bestScore := -1
+	ambiguous := false
 	for _, c := range candidates {
 		if c.Flags&net.FlagUp == 0 || c.Flags&net.FlagLoopback != 0 {
 			continue
@@ -212,6 +223,9 @@ func selectAutoNetwork(candidates []networkCandidate, adapterHint string) (Netwo
 			continue
 		}
 		name := strings.ToLower(c.Name)
+		if hint == "" && looksVirtualAdapter(name) {
+			continue
+		}
 		score := 10
 		if !looksVirtualAdapter(name) {
 			score += 100
@@ -228,6 +242,9 @@ func selectAutoNetwork(candidates []networkCandidate, adapterHint string) (Netwo
 		if score > bestScore {
 			best = c
 			bestScore = score
+			ambiguous = false
+		} else if score == bestScore && (best.Name != c.Name || best.IP != c.IP) {
+			ambiguous = true
 		}
 	}
 	if bestScore < 0 {
@@ -235,6 +252,9 @@ func selectAutoNetwork(candidates []networkCandidate, adapterHint string) (Netwo
 			return NetworkInfo{}, fmt.Errorf("auto network detection found no usable IPv4 adapter matching %q", adapterHint)
 		}
 		return NetworkInfo{}, fmt.Errorf("auto network detection found no usable IPv4 adapter")
+	}
+	if ambiguous {
+		return NetworkInfo{}, ErrAmbiguousNetwork
 	}
 	return NetworkInfo{
 		InterfaceName: best.Name,
@@ -275,6 +295,10 @@ func looksVirtualAdapter(name string) bool {
 		"zerotier",
 		"npcap",
 		"loopback",
+		"mihomo",
+		"clash",
+		"wintun",
+		"wireguard",
 	}
 	for _, word := range virtualWords {
 		if strings.Contains(name, word) {
@@ -307,14 +331,20 @@ func (c Config) Validate() error {
 	if c.BindPort <= 0 || c.BindPort > 65535 {
 		return fmt.Errorf("bind_port must be 1..65535")
 	}
-	if c.ReceiveTimeoutMillis <= 0 {
-		return fmt.Errorf("receive_timeout_ms must be positive")
+	if c.ReceiveTimeoutMillis < 100 || c.ReceiveTimeoutMillis > 30000 {
+		return fmt.Errorf("receive_timeout_ms must be 100..30000")
 	}
-	if c.RetryCount < 0 {
-		return fmt.Errorf("retry_count must be >= 0")
+	if c.RetryCount < 0 || c.RetryCount > 10 {
+		return fmt.Errorf("retry_count must be 0..10")
 	}
-	if c.HeartbeatIntervalSecs <= 0 {
-		return fmt.Errorf("heartbeat_interval_seconds must be positive")
+	if c.HeartbeatIntervalSecs < 1 || c.HeartbeatIntervalSecs > 300 {
+		return fmt.Errorf("heartbeat_interval_seconds must be 1..300")
+	}
+	if !usableIPv4(ipv4ToNetIP(c.IP)) || isZeroMAC(c.MAC) {
+		return fmt.Errorf("ip/mac must identify a usable adapter")
+	}
+	if c.BindIP != c.IP {
+		return fmt.Errorf("bind_ip must equal the authentication ip (or auto)")
 	}
 	return nil
 }
@@ -366,67 +396,41 @@ func ipv4String(v [4]byte) string {
 	return fmt.Sprintf("%d.%d.%d.%d", v[0], v[1], v[2], v[3])
 }
 
-func parseSimpleTOML(data string) (map[string]string, error) {
-	values := make(map[string]string)
-	scanner := bufio.NewScanner(strings.NewReader(data))
-	lineNo := 0
-	for scanner.Scan() {
-		lineNo++
-		line := strings.TrimSpace(stripComment(scanner.Text()))
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("line %d: expected key = value", lineNo)
-		}
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		if key == "" || value == "" {
-			return nil, fmt.Errorf("line %d: empty key or value", lineNo)
-		}
-		values[key] = value
+func parseTOML(data string) (map[string]any, error) {
+	values := make(map[string]any)
+	if _, err := toml.Decode(strings.TrimPrefix(data, "\ufeff"), &values); err != nil {
+		// Decoder diagnostics can quote the password source line.
+		return nil, fmt.Errorf("invalid TOML syntax; check quoting, types and duplicate keys")
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
+	allowed := strings.Fields("username password ip mac adapter_hint host_name os_info server_ip server_port bind_ip bind_port primary_dns dhcp_server auth_version keepalive_version first_heartbeat_version extra_heartbeat_version debug_hex_dump receive_timeout_ms retry_count heartbeat_interval_seconds")
+	for key := range values {
+		known := false
+		for _, k := range allowed {
+			if key == k {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return nil, fmt.Errorf("unknown configuration key (compare config.example.toml)")
+		}
 	}
 	return values, nil
 }
 
-func stripComment(line string) string {
-	inString := false
-	escaped := false
-	for i, r := range line {
-		switch {
-		case escaped:
-			escaped = false
-		case r == '\\' && inString:
-			escaped = true
-		case r == '"':
-			inString = !inString
-		case r == '#' && !inString:
-			return line[:i]
-		}
-	}
-	return line
-}
-
-func requiredString(values map[string]string, key string) (string, error) {
+func requiredString(values map[string]any, key string) (string, error) {
 	raw, ok := values[key]
 	if !ok {
 		return "", fmt.Errorf("missing required config key %q", key)
 	}
-	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+	value, ok := raw.(string)
+	if !ok {
 		return "", fmt.Errorf("%s must be a quoted string", key)
 	}
-	unquoted, err := strconv.Unquote(raw)
-	if err != nil {
-		return "", fmt.Errorf("%s: %w", key, err)
-	}
-	return unquoted, nil
+	return value, nil
 }
 
-func optionalString(values map[string]string, key string, fallback string) (string, error) {
+func optionalString(values map[string]any, key string, fallback string) (string, error) {
 	if _, ok := values[key]; !ok {
 		return fallback, nil
 	}
@@ -440,45 +444,45 @@ func optionalString(values map[string]string, key string, fallback string) (stri
 	return value, nil
 }
 
-func requiredInt(values map[string]string, key string) (int, error) {
+func requiredInt(values map[string]any, key string) (int, error) {
 	raw, ok := values[key]
 	if !ok {
 		return 0, fmt.Errorf("missing required config key %q", key)
 	}
-	n, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be an integer: %w", key, err)
+	n, ok := raw.(int64)
+	if !ok || int64(int(n)) != n {
+		return 0, fmt.Errorf("%s must be an integer in range", key)
 	}
-	return n, nil
+	return int(n), nil
 }
 
-func optionalInt(values map[string]string, key string, fallback int) (int, error) {
+func optionalInt(values map[string]any, key string, fallback int) (int, error) {
 	if _, ok := values[key]; !ok {
 		return fallback, nil
 	}
 	return requiredInt(values, key)
 }
 
-func requiredBool(values map[string]string, key string) (bool, error) {
+func requiredBool(values map[string]any, key string) (bool, error) {
 	raw, ok := values[key]
 	if !ok {
 		return false, fmt.Errorf("missing required config key %q", key)
 	}
-	b, err := strconv.ParseBool(raw)
-	if err != nil {
-		return false, fmt.Errorf("%s must be true or false: %w", key, err)
+	b, ok := raw.(bool)
+	if !ok {
+		return false, fmt.Errorf("%s must be true or false", key)
 	}
 	return b, nil
 }
 
-func optionalBool(values map[string]string, key string, fallback bool) (bool, error) {
+func optionalBool(values map[string]any, key string, fallback bool) (bool, error) {
 	if _, ok := values[key]; !ok {
 		return fallback, nil
 	}
 	return requiredBool(values, key)
 }
 
-func requiredIPv4(values map[string]string, key string) ([4]byte, error) {
+func requiredIPv4(values map[string]any, key string) ([4]byte, error) {
 	raw, err := requiredString(values, key)
 	if err != nil {
 		return [4]byte{}, err
@@ -492,7 +496,7 @@ func requiredIPv4(values map[string]string, key string) ([4]byte, error) {
 	return out, nil
 }
 
-func optionalIPv4(values map[string]string, key string, fallback [4]byte) ([4]byte, error) {
+func optionalIPv4(values map[string]any, key string, fallback [4]byte) ([4]byte, error) {
 	if _, ok := values[key]; !ok {
 		if fallback == [4]byte{} && key == "ip" {
 			return fallback, fmt.Errorf("%s is auto but no usable adapter was detected", key)
@@ -518,7 +522,7 @@ func optionalIPv4(values map[string]string, key string, fallback [4]byte) ([4]by
 	return out, nil
 }
 
-func requiredMAC(values map[string]string, key string) ([6]byte, error) {
+func requiredMAC(values map[string]any, key string) ([6]byte, error) {
 	raw, err := requiredString(values, key)
 	if err != nil {
 		return [6]byte{}, err
@@ -526,7 +530,7 @@ func requiredMAC(values map[string]string, key string) ([6]byte, error) {
 	return parseMAC(key, raw)
 }
 
-func optionalMAC(values map[string]string, key string, fallback [6]byte) ([6]byte, error) {
+func optionalMAC(values map[string]any, key string, fallback [6]byte) ([6]byte, error) {
 	if _, ok := values[key]; !ok {
 		if fallback == [6]byte{} {
 			return fallback, fmt.Errorf("%s is auto but no usable adapter was detected", key)
@@ -559,7 +563,7 @@ func parseMAC(key string, raw string) ([6]byte, error) {
 	return out, nil
 }
 
-func requiredHex2(values map[string]string, key string) ([2]byte, error) {
+func requiredHex2(values map[string]any, key string) ([2]byte, error) {
 	raw, err := requiredString(values, key)
 	if err != nil {
 		return [2]byte{}, err
@@ -576,14 +580,14 @@ func requiredHex2(values map[string]string, key string) ([2]byte, error) {
 	return out, nil
 }
 
-func optionalHex2(values map[string]string, key string, fallback [2]byte) ([2]byte, error) {
+func optionalHex2(values map[string]any, key string, fallback [2]byte) ([2]byte, error) {
 	if _, ok := values[key]; !ok {
 		return fallback, nil
 	}
 	return requiredHex2(values, key)
 }
 
-func isAutoValue(values map[string]string, key string) bool {
+func isAutoValue(values map[string]any, key string) bool {
 	_, ok := values[key]
 	if !ok {
 		return key == "ip" || key == "mac"

@@ -16,6 +16,9 @@ func RetryExchange(ctx context.Context, count int, fn func() error) error {
 			return err
 		}
 		if err := fn(); err != nil {
+			if !IsTimeout(err) {
+				return err
+			}
 			lastErr = err
 			continue
 		}

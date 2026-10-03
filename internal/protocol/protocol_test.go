@@ -114,6 +114,7 @@ func TestBuildLoginPacketFields(t *testing.T) {
 
 func TestLoginResponseParsing(t *testing.T) {
 	packet := make([]byte, 39)
+	packet[0] = 0x04
 	copy(packet[23:39], []byte("0123456789abcdef"))
 	var session Session
 	if err := ParseLoginResponse(packet, &session); err != nil {
@@ -121,6 +122,20 @@ func TestLoginResponseParsing(t *testing.T) {
 	}
 	if !bytes.Equal(session.ServerDrcomIndicator[:], []byte("0123456789abcdef")) {
 		t.Fatalf("server drcom indicator = % x", session.ServerDrcomIndicator)
+	}
+}
+
+func TestLoginResponseRejectsFailureAndUnrelatedPackets(t *testing.T) {
+	for _, code := range []byte{0x00, 0x02, 0x05, 0x07, 0xff} {
+		packet := make([]byte, 64)
+		packet[0] = code
+		session := Session{ServerDrcomIndicator: [16]byte{0xaa}}
+		if err := ParseLoginResponse(packet, &session); err == nil {
+			t.Errorf("accepted response type %02x", code)
+		}
+		if session.ServerDrcomIndicator != [16]byte{0xaa} {
+			t.Error("rejected response changed the session")
+		}
 	}
 }
 
@@ -172,7 +187,8 @@ func TestHeartbeatPackets(t *testing.T) {
 		t.Fatalf("step1 random token = % x", step1[8:12])
 	}
 
-	response := make([]byte, 20)
+	response := make([]byte, 40)
+	copy(response, []byte{0x07, byte(session.HeartbeatCount), 40, 0, 0x0b, 0x02})
 	copy(response[16:20], []byte{0xaa, 0xbb, 0xcc, 0xdd})
 	if err := ParseHeartbeatStep1Response(response, &session); err != nil {
 		t.Fatalf("ParseHeartbeatStep1Response() error = %v", err)

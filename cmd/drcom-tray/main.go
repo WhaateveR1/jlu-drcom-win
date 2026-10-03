@@ -1,38 +1,58 @@
 package main
 
 import (
-	"crypto/rand"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 
-	"jlu-drcom-win/internal/config"
 	"jlu-drcom-win/internal/logging"
 	"jlu-drcom-win/internal/trayapp"
 )
 
 func main() {
-	configPath := flag.String("config", "config.toml", "path to config.toml")
+	if err := run(); err != nil {
+		trayapp.ShowError(err.Error())
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	configPath := flag.String("config", filepath.Join(filepath.Dir(exe), "config.toml"), "configuration path")
+	autoLogin := flag.Bool("autologin", true, "authenticate on launch")
+	startup := flag.String("startup", "", "enable or disable current-user logon task")
 	flag.Parse()
-
-	absConfigPath, err := filepath.Abs(*configPath)
+	abs, err := filepath.Abs(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve config path: %v\n", err)
-		os.Exit(1)
+		return err
 	}
-
-	cfg, err := config.Load(absConfigPath)
+	if *startup != "" {
+		return trayapp.ConfigureStartup(*startup, abs)
+	}
+	release, alreadyRunning, err := trayapp.AcquireInstance()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
-		os.Exit(1)
+		return err
 	}
-
-	logger := logging.New(cfg.DebugHexDump)
-	logger.Info("config loaded", "server", cfg.ServerAddrString(), "bind", cfg.BindAddrString(), "adapter", cfg.AutoNetwork.InterfaceName)
-	app := trayapp.New(cfg, absConfigPath, rand.Reader, logger)
+	defer release()
+	if alreadyRunning {
+		return nil
+	}
+	logger, closer, logDir, err := logging.UserLogger()
+	if err != nil {
+		return fmt.Errorf("cannot open user log folder: %w", err)
+	}
+	defer closer.Close()
+	logger.Info("tray starting", "autologin", *autoLogin)
+	app := trayapp.New(abs, logDir, logger)
+	app.SetAutoLogin(*autoLogin)
 	if err := app.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "tray app failed: %v\n", err)
-		os.Exit(1)
+		logger.Error("tray failed", "error", err)
+		return err
 	}
+	logger.Info("tray stopped")
+	return nil
 }

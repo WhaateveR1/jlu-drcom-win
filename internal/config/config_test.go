@@ -69,6 +69,9 @@ password = "password"
 	if cfg.IP != [4]byte{49, 140, 167, 234} {
 		t.Fatalf("auto ip = %v", cfg.IP)
 	}
+	if cfg.BindIP != cfg.IP {
+		t.Fatalf("auto bind IP = %v, want authentication IP %v", cfg.BindIP, cfg.IP)
+	}
 	if cfg.MAC != [6]byte{0x74, 0xd4, 0xdd, 0xd1, 0xdc, 0x37} {
 		t.Fatalf("auto mac = % x", cfg.MAC)
 	}
@@ -165,6 +168,24 @@ func TestSelectAutoNetworkRejectsMissingAdapterHint(t *testing.T) {
 	}
 }
 
+func TestAutoNetworkWaitsForPhysicalAdapter(t *testing.T) {
+	for _, name := range []string{"vEthernet (Default Switch)", "Mihomo", "Clash", "Wintun"} {
+		candidates := []networkCandidate{{Name: name, Flags: net.FlagUp, IP: [4]byte{198, 18, 0, 1}, MAC: [6]byte{1, 2, 3, 4, 5, 6}}}
+		if _, err := selectAutoNetwork(candidates, ""); err == nil {
+			t.Errorf("selected virtual adapter %s while physical network was unavailable", name)
+		}
+		if _, err := selectAutoNetwork(candidates, name); err != nil {
+			t.Errorf("explicit adapter hint must remain supported: %v", err)
+		}
+	}
+}
+
+func TestExplicitWildcardBindIsRejected(t *testing.T) {
+	if _, err := Parse(replaceLine(validConfig(), `bind_ip = "auto"`, `bind_ip = "0.0.0.0"`)); err == nil {
+		t.Fatal("wildcard bind must not bypass the campus interface")
+	}
+}
+
 func replaceLine(data, old, new string) string {
 	return stringsReplace(data, old, new, 1)
 }
@@ -197,7 +218,7 @@ os_info = "Windows 11"
 
 server_ip = "10.100.61.3"
 server_port = 61440
-bind_ip = "0.0.0.0"
+bind_ip = "auto"
 bind_port = 61440
 
 auth_version = "6800"

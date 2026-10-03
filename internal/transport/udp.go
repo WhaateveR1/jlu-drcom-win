@@ -1,13 +1,14 @@
 package transport
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"time"
 )
 
-const defaultReceiveBufferSize = 512
+const defaultReceiveBufferSize = 4096
 
 var ErrTimeout = errors.New("udp receive timeout")
 
@@ -32,6 +33,10 @@ func NewTransport(bindAddr, serverAddr *net.UDPAddr, timeout time.Duration) (*Tr
 	if err != nil {
 		return nil, err
 	}
+	if err := pinInterface(conn, bindAddr.IP); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("select authentication interface: %w", err)
+	}
 	return &Transport{
 		conn:    conn,
 		server:  serverAddr,
@@ -39,31 +44,64 @@ func NewTransport(bindAddr, serverAddr *net.UDPAddr, timeout time.Duration) (*Tr
 	}, nil
 }
 
-func (t *Transport) Exchange(packet []byte) ([]byte, error) {
+// Exchange has a single owner. Unrelated/late datagrams never extend its deadline.
+func (t *Transport) Exchange(ctx context.Context, packet []byte, match func([]byte) (bool, error)) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(t.timeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	if err := t.conn.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
+	finished := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = t.conn.SetDeadline(time.Now())
+		close(finished)
+	})
+	defer func() {
+		if !stop() {
+			<-finished
+		}
+		_ = t.conn.SetDeadline(time.Time{})
+	}()
 	if _, err := t.conn.WriteToUDP(packet, t.server); err != nil {
-		return nil, err
-	}
-
-	if err := t.conn.SetReadDeadline(time.Now().Add(t.timeout)); err != nil {
-		return nil, err
-	}
-	buf := make([]byte, defaultReceiveBufferSize)
-	n, addr, err := t.conn.ReadFromUDP(buf)
-	if err != nil {
-		if ne, ok := err.(net.Error); ok && ne.Timeout() {
-			return nil, ErrTimeout
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 		return nil, err
 	}
-	if !sameUDPAddr(addr, t.server) {
-		return nil, fmt.Errorf("unexpected udp peer: got %s want %s", addr, t.server)
+	buf := make([]byte, defaultReceiveBufferSize)
+	for {
+		n, addr, err := t.conn.ReadFromUDP(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if d, ok := ctx.Deadline(); ok && !time.Now().Before(d) {
+				return nil, context.DeadlineExceeded
+			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				return nil, ErrTimeout
+			}
+			return nil, err
+		}
+		if !sameUDPAddr(addr, t.server) {
+			continue
+		}
+		if match != nil {
+			ok, err := match(buf[:n])
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
+		}
+		return append([]byte(nil), buf[:n]...), nil
 	}
-	return append([]byte(nil), buf[:n]...), nil
-}
-
-func (t *Transport) Send(packet []byte) error {
-	_, err := t.conn.WriteToUDP(packet, t.server)
-	return err
 }
 
 func (t *Transport) Close() error {
