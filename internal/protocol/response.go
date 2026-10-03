@@ -9,7 +9,7 @@ var ErrRejected = errors.New("server rejected request")
 
 // ResponseMatcher identifies the reply belonging to this request. Payloads are
 // never included in errors: several replies contain reusable session secrets.
-func ResponseMatcher(request []byte) func([]byte) (bool, error) {
+func ResponseMatcher(request []byte, allowFile bool) func([]byte) (bool, error) {
 	return func(p []byte) (bool, error) {
 		if len(p) == 0 || len(request) == 0 {
 			return false, nil
@@ -34,7 +34,7 @@ func ResponseMatcher(request []byte) func([]byte) (bool, error) {
 				return p[5] == 0x04, nil
 			}
 			// First/extra requests can return the server's file/update packet.
-			if request[6] == 0x0f || request[6] == 0xdb {
+			if allowFile {
 				return p[5] == 0x06 || p[5] == 0x02, nil
 			}
 			return p[5] == 0x02, nil

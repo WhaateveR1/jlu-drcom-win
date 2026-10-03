@@ -6,7 +6,7 @@ func TestResponseMatcherRejectsWrongPhaseSequenceAndTruncation(t *testing.T) {
 	req := []byte{7, 9, 40, 0, 0x0b, 1, 0xdc, 2}
 	good := make([]byte, 40)
 	copy(good, []byte{7, 9, 40, 0, 0x0b, 2})
-	match := ResponseMatcher(req)
+	match := ResponseMatcher(req, false)
 	if ok, err := match(good); !ok || err != nil {
 		t.Fatal(ok, err)
 	}
@@ -47,5 +47,20 @@ func TestKeepaliveAndLogoutObservedShapes(t *testing.T) {
 
 func FuzzResponseMatcher(f *testing.F) {
 	f.Add([]byte{7, 0, 40, 0, 11, 1, 0xdc, 2}, []byte{5})
-	f.Fuzz(func(t *testing.T, request, response []byte) { ResponseMatcher(request)(response) })
+	f.Fuzz(func(t *testing.T, request, response []byte) {
+		ResponseMatcher(request, false)(response)
+		ResponseMatcher(request, true)(response)
+	})
+}
+
+func TestFileResponseUsesRequestRoleNotHardcodedVersion(t *testing.T) {
+	request := []byte{7, 21, 40, 0, 11, 1, 0xab, 0xcd}
+	p := make([]byte, 272)
+	copy(p, []byte{7, 21, 0x10, 1, 11, 6})
+	if ok, err := ResponseMatcher(request, true)(p); !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	if ok, _ := ResponseMatcher(request, false)(p); ok {
+		t.Fatal("regular heartbeat consumed a file response")
+	}
 }

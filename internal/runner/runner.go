@@ -51,13 +51,14 @@ func (r *Runner) setState(s State) {
 	}
 }
 
-func (r *Runner) exchange(ctx context.Context, name string, packet []byte) ([]byte, error) {
+func (r *Runner) exchange(ctx context.Context, name string, packet []byte, allowFile bool) ([]byte, error) {
 	var response []byte
+	match := protocol.ResponseMatcher(packet, allowFile)
 	err := transport.RetryExchange(ctx, r.cfg.RetryCount+1, func() error {
 		var err error
-		response, err = r.exchanger.Exchange(ctx, packet, protocol.ResponseMatcher(packet))
+		response, err = r.exchanger.Exchange(ctx, packet, match)
 		if err == nil {
-			ok, matchErr := protocol.ResponseMatcher(packet)(response)
+			ok, matchErr := match(response)
 			if matchErr != nil {
 				err = matchErr
 			} else if !ok {
@@ -79,7 +80,7 @@ func (r *Runner) Login(ctx context.Context) (protocol.Session, error) {
 	var s protocol.Session
 	cfg := r.cfg.ProtocolConfig()
 	r.setState(StateLoginChallenge)
-	p, err := r.exchange(ctx, "login challenge", protocol.BuildLoginChallenge(cfg.AuthVersion, r.rng))
+	p, err := r.exchange(ctx, "login challenge", protocol.BuildLoginChallenge(cfg.AuthVersion, r.rng), false)
 	if err != nil {
 		return s, err
 	}
@@ -88,7 +89,7 @@ func (r *Runner) Login(ctx context.Context) (protocol.Session, error) {
 		return s, err
 	}
 	r.setState(StateLoggingIn)
-	p, err = r.exchange(ctx, "login", protocol.BuildLoginPacket(cfg, &s, r.rng))
+	p, err = r.exchange(ctx, "login", protocol.BuildLoginPacket(cfg, &s, r.rng), false)
 	if errors.Is(err, protocol.ErrRejected) {
 		return s, ErrAuthenticationRejected
 	}
@@ -139,7 +140,7 @@ func (r *Runner) Run(ctx context.Context) error {
 func (r *Runner) Logout(ctx context.Context, s *protocol.Session) error {
 	r.setState(StateLoggingOut)
 	cfg := r.cfg.ProtocolConfig()
-	p, err := r.exchange(ctx, "logout challenge", protocol.BuildLogoutChallenge(cfg.AuthVersion, r.rng))
+	p, err := r.exchange(ctx, "logout challenge", protocol.BuildLogoutChallenge(cfg.AuthVersion, r.rng), false)
 	if err != nil {
 		return err
 	}
@@ -147,7 +148,7 @@ func (r *Runner) Logout(ctx context.Context, s *protocol.Session) error {
 	if err != nil {
 		return err
 	}
-	if _, err := r.exchange(ctx, "logout", protocol.BuildLogoutPacket(cfg, *s)); err != nil {
+	if _, err := r.exchange(ctx, "logout", protocol.BuildLogoutPacket(cfg, *s), false); err != nil {
 		return err
 	}
 	r.setState(StateStopped)
@@ -167,7 +168,7 @@ func (r *Runner) HeartbeatOnce(ctx context.Context, s *protocol.Session) error {
 		} else {
 			packet = protocol.BuildExtraHeartbeat(cfg, *s, r.rng)
 		}
-		if _, err := r.exchange(ctx, "first/extra heartbeat", packet); err != nil {
+		if _, err := r.exchange(ctx, "first/extra heartbeat", packet, true); err != nil {
 			return err
 		}
 		s.HeartbeatCount++
@@ -175,7 +176,7 @@ func (r *Runner) HeartbeatOnce(ctx context.Context, s *protocol.Session) error {
 	step1 := protocol.BuildHeartbeatStep1(cfg, *s, r.rng)
 	var randomToken [4]byte
 	copy(randomToken[:], step1[8:12])
-	p, err := r.exchange(ctx, "heartbeat step1", step1)
+	p, err := r.exchange(ctx, "heartbeat step1", step1, false)
 	if err != nil {
 		return err
 	}
@@ -183,7 +184,7 @@ func (r *Runner) HeartbeatOnce(ctx context.Context, s *protocol.Session) error {
 		return err
 	}
 	s.HeartbeatCount++
-	if _, err := r.exchange(ctx, "heartbeat step2", protocol.BuildHeartbeatStep2(cfg, *s, randomToken)); err != nil {
+	if _, err := r.exchange(ctx, "heartbeat step2", protocol.BuildHeartbeatStep2(cfg, *s, randomToken), false); err != nil {
 		return err
 	}
 	s.HeartbeatCount++
@@ -192,7 +193,7 @@ func (r *Runner) HeartbeatOnce(ctx context.Context, s *protocol.Session) error {
 }
 
 func (r *Runner) KeepAliveAuth(ctx context.Context, s protocol.Session, now time.Time) error {
-	_, err := r.exchange(ctx, "keepalive auth", protocol.BuildKeepAliveAuth(s, now))
+	_, err := r.exchange(ctx, "keepalive auth", protocol.BuildKeepAliveAuth(s, now), false)
 	return err
 }
 
